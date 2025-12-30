@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracking WiFi - Temps Réel</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { height: 100vh; width: 100%; }
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.2);
+            max-width: 300px;
+        }
+        .status-dot {
+            height: 10px; width: 10px;
+            background-color: #bbb;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        .active { background-color: #28a745; box-shadow: 0 0 5px #28a745; }
+    </style>
+</head>
+<body>
+
+    <div id="info-panel">
+        <h3>Position WiFi <span id="status-dot" class="status-dot"></span></h3>
+        <p>Lat: <span id="lat">--</span></p>
+        <p>Lon: <span id="lon">--</span></p>
+        <p>Dernière màj: <span id="last-update">Jamais</span></p>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        // 1. Initialisation de la carte
+        // On centre par défaut sur Paris (sera mis à jour dès la 1ère réception)
+        const map = L.map('map').setView([48.8566, 2.3522], 18);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        // Création du marqueur (un cercle bleu pour différencier)
+        let userMarker = L.circleMarker([0, 0], {
+            radius: 10,
+            fillColor: "#3388ff",
+            color: "#fff",
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.8
+        }).addTo(map);
+
+        let firstFix = false;
+
+        // 2. Fonction pour récupérer la position
+        async function fetchPosition() {
+            try {
+                const response = await fetch('/api/last_position');
+                const data = await response.json();
+
+                if (data.lat && data.lon) {
+                    const lat = parseFloat(data.lat);
+                    const lon = parseFloat(data.lon);
+
+                    // Mise à jour du texte
+                    document.getElementById('lat').innerText = lat.toFixed(5);
+                    document.getElementById('lon').innerText = lon.toFixed(5);
+                    
+                    const date = new Date(data.timestamp * 1000);
+                    document.getElementById('last-update').innerText = date.toLocaleTimeString();
+                    
+                    // Indicateur visuel (Vert)
+                    document.getElementById('status-dot').classList.add('active');
+
+                    // Mise à jour du marqueur
+                    const newLatLng = new L.LatLng(lat, lon);
+                    userMarker.setLatLng(newLatLng);
+
+                    // Si c'est la première fois qu'on a une position, on centre la carte
+                    if (!firstFix) {
+                        map.setView(newLatLng, 19);
+                        firstFix = true;
+                    }
+                }
+            } catch (error) {
+                console.error("Erreur récup position:", error);
+                document.getElementById('status-dot').classList.remove('active');
+            }
+        }
+
+        // 3. Lancer la boucle (toutes les 1 seconde)
+        setInterval(fetchPosition, 1000);
+        
+    </script>
+</body>
+</html>

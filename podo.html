@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Podomètre HTML5 Kalman</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; background: #eee; }
+        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        h1 { margin: 0 0 20px 0; color: #e66000; }
+        .stat-val { font-size: 2.5em; font-weight: bold; color: #333; }
+        .stat-label { color: #777; font-size: 0.9em; text-transform: uppercase; }
+        input { padding: 8px; width: 60px; text-align: center; }
+        button { padding: 10px 20px; background: #00b6f0; color: white; border: none; border-radius: 5px; font-size: 1.2em; cursor: pointer; }
+        button#stop { background: #ff4444; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h1>Podomètre</h1>
+        <div>
+            <div class="stat-val" id="stepCount">0</div>
+            <div class="stat-label">Pas</div>
+        </div>
+        <br>
+        <div>
+            <span class="stat-val" id="distance">0.00</span> km
+        </div>
+        <div>
+            <span class="stat-val" id="calories">0</span> kcal
+        </div>
+    </div>
+
+    <div class="card">
+        <label>Poids (kg): <input type="number" id="weight" value="70"></label>
+        <label>Pas (cm): <input type="number" id="stride" value="70"></label>
+    </div>
+
+    <button id="btnStart" onclick="startTracking()">Démarrer</button>
+    <button id="btnStop" onclick="stopTracking()" style="display:none;">Arrêter</button>
+
+<script>
+    /* --- CONFIGURATION SELON L'ARTICLE --- */
+    const FREQUENCY = 50; // Hz (Fréquence visée)
+    const WINDOW_SIZE = 2 * FREQUENCY; // Fenêtre de 2 secondes pour le seuil
+    const MIN_STEP_DELAY = 300; // ms (Filtre temporel pour éviter les faux pas rapides)
+    const MIN_VARIANCE = 0.5; // Seuil minimum de variance pour considérer un mouvement
+
+    // Variables d'état
+    let steps = 0;
+    let isRunning = false;
+    let lastStepTime = 0;
+    let dataWindow = []; // Tampon circulaire pour le calcul du seuil dynamique
+    
+    /* --- 1. FILTRE DE KALMAN (Implémentation Scalaire) --- */
+    // Basé sur les équations fournies dans votre texte
+    class KalmanFilter {
+        constructor() {
+            this.Q = 0.0001; // Bruit du processus (Process noise)
+            this.R = 0.01;   // Bruit de mesure (Measurement noise)
+            this.P = 1;      // Covariance de l'erreur d'estimation
+            this.X = 0;      // Valeur estimée (l'accélération filtrée)
+            this.K = 0;      // Gain de Kalman
+        }
+
+        filter(measurement) {
+            // Mise à jour de la prédiction (P = P + Q)
+            this.P = this.P + this.Q;
+
+            // Mise à jour de la mesure (Calcul du gain K)
+            this.K = this.P / (this.P + this.R);
+            // Mise à jour de l'état estimé X
+            this.X = this.X + this.K * (measurement - this.X);
+            // Mise à jour de la covariance P
+            this.P = (1 - this.K) * this.P;
+
+            return this.X;
+        }
+    }
+
+    const kalman = new KalmanFilter();
+
+    /* --- 2. TRAITEMENT DU SIGNAL --- */
+    function handleMotion(event) {
+        // A. Acquisition : Norme du vecteur accélération
+        // Utilisation de accelerationIncludingGravity pour simplifier la détection d'orientation
+        let acc = event.accelerationIncludingGravity;
+        if (!acc) return; 
+        
+        // Norme 3D : sqrt(x² + y² + z²)
+        let rawNorm = Math.sqrt(acc.x*acc.x + acc.y*acc.y + acc.z*acc.z);
+
+        // B. Filtrage : Application du filtre de Kalman
+        let filteredNorm = kalman.filter(rawNorm);
+
+        // C. Seuil Dynamique (Moyenne min/max sur fenêtre de 2 secondes)
+        dataWindow.push(filteredNorm);
+        if (dataWindow.length > WINDOW_SIZE) dataWindow.shift(); // Maintenir la taille fixe
+
+        // On attend d'avoir rempli la fenêtre (2s) avant de détecter
+        if (dataWindow.length < WINDOW_SIZE) return;
+
+        let min = Math.min(...dataWindow);
+        let max = Math.max(...dataWindow);
+        let threshold = (min + max) / 2; // Le seuil est la moyenne des extrêmes
+        
+        // D. Détection du pas
+        let now = Date.now();
+        
+        // Condition 1 : L'amplitude du mouvement doit dépasser la sensibilité (MIN_VARIANCE)
+        if ((max - min) > MIN_VARIANCE) {
+            // Condition 2 : Respecter le délai minimum entre deux pas (ex: 200ms)
+            if (now - lastStepTime > MIN_STEP_DELAY) {
+                // Condition 3 : Détection de front descendant (Falling edge)
+                // On regarde si le signal passe de "Au-dessus" à "En-dessous" du seuil
+                let currentVal = dataWindow[dataWindow.length - 1];
+                let prevVal = dataWindow[dataWindow.length - 2];
+
+                if (prevVal > threshold && currentVal <= threshold) {
+                    recordStep();
+                    lastStepTime = now;
+                }
+            }
+        }
+    }
+
+    /* --- 3. UI & UTILITAIRES --- */
+    function recordStep() {
+        steps++;
+        document.getElementById('stepCount').innerText = steps;
+        
+        let strideLengthCm = parseFloat(document.getElementById('stride').value);
+        let weightKg = parseFloat(document.getElementById('weight').value);
+        
+        // Distance (km)
+        let distanceKm = (steps * strideLengthCm) / 100000;
+        document.getElementById('distance').innerText = distanceKm.toFixed(3);
+
+        // Calories (Estimation simple)
+        let kcal = distanceKm * weightKg * 0.9; 
+        document.getElementById('calories').innerText = kcal.toFixed(1);
+
+        if (steps%10 == 0) {
+            console.log(steps)
+            fetch("/post_podo", {
+               method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ s: steps })
+            });
+        }
+    }
+
+    function startTracking() {
+        // Demande de permission pour iOS 13+
+        if (typeof DeviceMotionEvent.requestPermission === 'function') {
+            DeviceMotionEvent.requestPermission()
+                .then(response => {
+                    if (response == 'granted') initSensor();
+                })
+                .catch(console.error);
+        } else {
+            // Android et autres
+            initSensor();
+        }
+    }
+
+    function initSensor() {
+        steps = 0;
+        dataWindow = [];
+        window.addEventListener('devicemotion', handleMotion, true);
+        isRunning = true;
+        document.getElementById('btnStart').style.display = 'none';
+        document.getElementById('btnStop').style.display = 'inline-block';
+        document.getElementById('stepCount').innerText = "0";
+    }
+
+    function stopTracking() {
+        window.removeEventListener('devicemotion', handleMotion, true);
+        isRunning = false;
+        document.getElementById('btnStart').style.display = 'inline-block';
+        document.getElementById('btnStop').style.display = 'none';
+    }
+</script>
+</body>
+</html>
