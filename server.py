@@ -12,88 +12,31 @@ import os
 from types import SimpleNamespace 
 
 # ===========================================
-# Configuration et BDD
+# Configuration and DB
 # ===========================================
+
+# Globals
+GPS_TIME_WINDOW_MAX = 30000 
+MIN_DISTANCE_FOR_MOVEMENT = 5.0 
+
+# For testing (real time position estimation)
+last_estimated_position = None
+
+# Training buffers
+rssi_buffer = []
+gps_buffer = []
 
 app = FastAPI(title="Tracking Fusion Server")
 
+# DB
 DB_NAME = "tracking.db"
-
-# Pour le test (affichage temps réel)
-last_estimated_position = None
-
-# ===========================================
-# Algorithme de positionnement (k-NN)
-# ===========================================
-
-def calculate_position_knn(current_scan, k=3):
-    """
-    Compare le scan actuel avec l'historique de la base de donnée et retourne la position.
-    """
-    # Récupérer les empruntes connues (Bdd)
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, bssid, rssi_avg, lat, lon FROM measurements WHERE lat IS NOT 0 AND lon IS NOT 0")
-        rows = cursor.fetchall()
-        conn.close()
-    except Exception as e:
-        print(f"Erreur lecture DB pour positionnement: {e}")
-        return None
-
-    fingerprints = defaultdict(lambda: {'coords': (0, 0), 'signals': {}})
-    
-    for row in rows:
-        ts = row['timestamp']
-        fingerprints[ts]['coords'] = (row['lat'], row['lon'])
-        fingerprints[ts]['signals'][row['bssid']] = row['rssi_avg']
-
-    distances = []
-    current_signals = {item.bssid: float(item.rssi) for item in current_scan}
-    
-    for ts, fp_data in fingerprints.items():
-        stored_signals = fp_data['signals']
-        
-        common_keys = set(current_signals.keys()) & set(stored_signals.keys())
-        if not common_keys:
-            continue
-
-        sum_sq_diff = 0
-        all_keys = set(current_signals.keys()) | set(stored_signals.keys())
-        
-        for bssid in all_keys:
-            v1 = current_signals.get(bssid, -100)
-            v2 = stored_signals.get(bssid, -100)
-            sum_sq_diff += (v1 - v2) ** 2
-            
-        euclidean_dist = math.sqrt(sum_sq_diff)
-        
-        distances.append({
-            'dist': euclidean_dist,
-            'lat': fp_data['coords'][0],
-            'lon': fp_data['coords'][1]
-        })
-
-    distances.sort(key=lambda x: x['dist'])
-    nearest_neighbors = distances[:k]
-    
-    if not nearest_neighbors:
-        return None
-
-    avg_lat = sum(n['lat'] for n in nearest_neighbors) / len(nearest_neighbors)
-    avg_lon = sum(n['lon'] for n in nearest_neighbors) / len(nearest_neighbors)
-    
-    print(f"📍 Position estimée (WiFi) basée sur {len(nearest_neighbors)} voisins: {avg_lat}, {avg_lon}")
-    
-    return {'lat': avg_lat, 'lon': avg_lon}
-
 
 def init_db():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    # Allow user to read and write at same time
     conn.execute('PRAGMA journal_mode=WAL;') 
     
-    # Table pour l'apprentissage (Training)
+    # Training table
     conn.execute('''
         CREATE TABLE IF NOT EXISTS measurements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,7 +53,7 @@ def init_db():
         )
     ''')
 
-    # [NOUVEAU] Table pour l'historique des estimations (Testing)
+    # Testing table
     conn.execute('''
         CREATE TABLE IF NOT EXISTS estimations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,12 +65,14 @@ def init_db():
         )
     ''')
     
+    # Write in .db
     conn.commit()
     return conn
 
 # ===========================================
-# Structures de données
+# Data structures
 # ===========================================
+# BaseModel comes from Pydantic to assert data types (also do Json parsing)
 
 class NetworkItem(BaseModel):
     bssid    : str
@@ -146,23 +91,92 @@ class GpsData(BaseModel):
     lon: float
     timestamp: Optional[int] = None
 
-class PodoMeter(BaseModel):
-    s: int
-
 # ===========================================
-# LOGIQUE de création de la BDD (Training)
+# Algorithm
 # ===========================================
 
-GPS_TIME_WINDOW_MAX = 30000 
-MIN_DISTANCE_FOR_MOVEMENT = 5.0 
+def calculate_position_knn(current_scan, k=3):
+    """
+    Compare le scan actuel avec l'historique de la base de donnée et retourne la position.
+    """
 
-rssi_buffer = []
-gps_buffer = []
+    # Collect knowns footprints
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp, bssid, rssi_avg, lat, lon FROM measurements WHERE lat IS NOT 0 AND lon IS NOT 0")
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"Erreur lecture DB pour positionnement: {e}")
+        return None
+
+    # defaultdict : crée clef selon lambda si elle n'existe pas 
+    fingerprints = defaultdict(lambda: {'coords': (0, 0), 'signals': {}})
+    
+    # fill dict with DB values
+    for row in rows:
+        ts = row['timestamp']
+        fingerprints[ts]['coords'] = (row['lat'], row['lon'])
+        fingerprints[ts]['signals'][row['bssid']] = row['rssi_avg']
+
+    distances = []
+    current_signals = {item.bssid: float(item.rssi) for item in current_scan}
+    
+    for ts, fp_data in fingerprints.items():
+        # Only keep signals for comparison
+        stored_signals = fp_data['signals']
+        
+        # Check if common BSSID (measured and DB)
+        common_keys = set(current_signals.keys()) & set(stored_signals.keys())
+        if not common_keys:
+            continue
+
+        # Get all BSSID (union)
+        sum_sq_diff = 0
+        all_keys = set(current_signals.keys()) | set(stored_signals.keys())
+        
+        for bssid in all_keys:
+            # returns -100 if no value found
+            v1 = current_signals.get(bssid, -100)
+            v2 = stored_signals.get(bssid, -100)
+            sum_sq_diff += (v1 - v2) ** 2
+            
+        euclidean_dist = math.sqrt(sum_sq_diff)
+        
+        distances.append({
+            'dist': euclidean_dist,
+            'lat': fp_data['coords'][0],
+            'lon': fp_data['coords'][1]
+        })
+
+    # Keep shortest distances
+    distances.sort(key=lambda x: x['dist'])
+    nearest_neighbors = distances[:k]
+    
+    if not nearest_neighbors:
+        return None
+
+    # Avg lat and long
+    avg_lat = sum(n['lat'] for n in nearest_neighbors) / len(nearest_neighbors)
+    avg_lon = sum(n['lon'] for n in nearest_neighbors) / len(nearest_neighbors)
+    
+    print(f"Position estimée (WiFi) basée sur {len(nearest_neighbors)} voisins: {avg_lat}, {avg_lon}")
+    
+    return {'lat': avg_lat, 'lon': avg_lon}
 
 def lerp(start, end, alpha):
+    """
+    Linear interpolation
+    """
     return start + (end - start) * alpha
 
 def get_distance_haversine(lat1, lon1, lat2, lon2):
+
+    """
+    Distance between two lat/long positions
+    """
     R = 6371000.0
     d_lat = math.radians(lat2 - lat1)
     d_lon = math.radians(lon2 - lon1)
@@ -172,63 +186,83 @@ def get_distance_haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+# ===========================================
+# Database filling
+# ===========================================
+
 def process_buffers():
+
+    """"
+    Combine rssi data coming from the ESP32 with localisation data coming from Smartphone.
+    Buffers are filled with two routes : /esp32 /gps.
+    It combines data using timestamps.
+    Old data are automatically removed.
+    """
     global rssi_buffer, gps_buffer
 
     if len(gps_buffer) < 4:
         return
 
+    # Sort by timestamp
     gps_buffer.sort(key=lambda x: x['timestamp'])
     rssi_buffer.sort(key=lambda x: x['timestamp'])
 
     unprocessed_rssi = []
     to_insert = []
 
+    # From a rssi measure look from the next and previous gps value according to the timestamp
     for rssi_data in rssi_buffer:
         t_target = rssi_data['timestamp']
 
+        # Find next
         next_gps_index = -1
         for i, g in enumerate(gps_buffer):
             if g['timestamp'] >= t_target:
                 next_gps_index = i
                 break
         
+        # No gps position after the rssi point : no possible interpolation
+        # add to unprocessed list
         if next_gps_index == -1:
             unprocessed_rssi.append(rssi_data)
             continue
         if next_gps_index == 0:
             continue
 
+        # Gps data for interpolation : get time difference
         next_gps = gps_buffer[next_gps_index]
         prev_gps = gps_buffer[next_gps_index - 1]
-
         time_diff = next_gps['timestamp'] - prev_gps['timestamp']
-        
         if time_diff > GPS_TIME_WINDOW_MAX:
             continue
 
+        # Estimate walking between prev and next gps points
         dist_meters = get_distance_haversine(prev_gps['lat'], prev_gps['lon'], next_gps['lat'], next_gps['lon'])
         
         final_lat = 0.0
         final_lon = 0.0
         method = ""
 
+        # If small distance no interpolation (static) else interpolation
         if dist_meters < MIN_DISTANCE_FOR_MOVEMENT:
             final_lat = prev_gps['lat']
             final_lon = prev_gps['lon']
             method = 'static'
         else:
+            # Pourcentage of progression between the two gps points
             alpha = (t_target - prev_gps['timestamp']) / time_diff
             final_lat = lerp(prev_gps['lat'], next_gps['lat'], alpha)
             final_lon = lerp(prev_gps['lon'], next_gps['lon'], alpha)
             method = 'interpolated'
             
+        # Add the point for which the coordinates have been calculated
         to_insert.append((
             rssi_data['timestamp'], rssi_data['bssid'], rssi_data['rssi_average'],
             rssi_data['rssi_median'], rssi_data['rssi_std'], rssi_data['channel'],
             final_lat, final_lon, method
         ))
 
+    # If rssi points have been linked to gps coordinates then insert them into SQL DB
     if to_insert:
         try:
             with db_conn:
@@ -241,8 +275,10 @@ def process_buffers():
         except Exception as e:
             print(f"Erreur DB: {e}")
 
+    # Update Rssi buffer
     rssi_buffer = unprocessed_rssi
     
+    # Take oldest rssi value and delete older gps values (no possible interpolation)
     if rssi_buffer:
         oldest_needed = rssi_buffer[0]['timestamp']
         boundary_index = 0
@@ -252,13 +288,18 @@ def process_buffers():
                 break
         if boundary_index > 1:
             del gps_buffer[:boundary_index - 1]
+    # If rssi buffer is empty (all points have been processed) only keep last gps point
     elif len(gps_buffer) > 1:
         gps_buffer = gps_buffer[-1:]
 
 # ===========================================
 # ROUTES API
 # ===========================================
+# FastApi fonctionne sur une event loop (boucle infinie)
+# async évite la création de Threads pour des tâches simples
 
+# FILL route
+# Base route : used for client to place gps points 
 @app.get("/map.js")
 async def read_map_js():
     file_path = os.path.join(os.path.dirname(__file__), "map.js")
@@ -266,6 +307,42 @@ async def read_map_js():
         return FileResponse(file_path)
     return {"error": "File not found"}, 404
 
+# Used by web client to display DB points
+@app.get("/points")
+async def get_points():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT lat, lon, timestamp, rssi_avg, method FROM measurements")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"Erreur lecture DB: {e}")
+        return []
+    
+# TEST routes 
+# Route to get test map
+@app.get("/map_test")
+async def read_map_test():
+    file_path = os.path.join(os.path.dirname(__file__), "map_test.html")
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    return {"error": "Créez le fichier map_test.html d'abord !"}, 404
+
+# Used by web client to display last position 
+@app.get("/api/last_position")
+async def get_last_position():
+    # Retourne toujours la dernière position connue en RAM
+    return last_estimated_position if last_estimated_position else {}
+    
+# ===========================================
+# ROUTE DE REMPLISSAGE DE DB
+# ===========================================
+# Each received message fill a buffer and start process_buffer treatment
+
+# Used by esp32 to send rssi measured values
 @app.post("/esp32")
 async def receive_esp32(payload: EspBatchPayload):
     batch_timestamp_ms = payload.timestamp * 1000
@@ -286,6 +363,7 @@ async def receive_esp32(payload: EspBatchPayload):
     process_buffers()
     return {"status": "OK", "processed": count}
 
+# Used by esp32 to send gps values
 @app.post("/gps")
 async def receive_gps(gps_data: GpsData):
     current_time = gps_data.timestamp
@@ -301,23 +379,11 @@ async def receive_gps(gps_data: GpsData):
     process_buffers()
     return {"status": "OK"}
 
-@app.get("/points")
-async def get_points():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT lat, lon, timestamp, rssi_avg, method FROM measurements")
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
-    except Exception as e:
-        print(f"Erreur lecture DB: {e}")
-        return []
+# ===========================================
+# ROUTE DE TEST 
+# ===========================================
 
-# ===========================================
-# ROUTE DE TEST (POSITIONNEMENT + HISTORISATION)
-# ===========================================
+# Measured rssi sent by esp32
 @app.post("/esp32_test")
 async def receive_esp32_test(payload: EspBatchPayload):
     global last_estimated_position
@@ -326,14 +392,15 @@ async def receive_esp32_test(payload: EspBatchPayload):
     print(f"Reception d'un scan de test avec {len(payload.networks)} réseaux")
 
     for net in payload.networks:
+        # SimpleNamespace permet d'utiliser la notation pointée (item.rssi) au lieu des crochets. Objet nettoyé et renommé
         item = SimpleNamespace(bssid=net.bssid, rssi=net.rssi_avg)
         formatted_scan.append(item)
     
-    # 1. Calcul de la position
+    # Calculation of the position
     estimated_pos = calculate_position_knn(formatted_scan, k=3)
     
     if estimated_pos:
-        # 2. Mise à jour de la variable globale (pour l'affichage "live" sur la carte)
+        # Global variable update to display on the client map
         last_estimated_position = {
             "lat": estimated_pos['lat'],
             "lon": estimated_pos['lon'],
@@ -341,9 +408,9 @@ async def receive_esp32_test(payload: EspBatchPayload):
             "neighbors_count": len(payload.networks)
         }
 
-        # 3. [NOUVEAU] Sauvegarde dans la BDD pour historique
+        # History of client gps coordinates
         try:
-            # On ouvre une connexion locale à la route pour l'insertion rapide
+            # Connexion and insertion into estimation table in SQL DB
             with sqlite3.connect(DB_NAME) as conn:
                 conn.execute('''
                     INSERT INTO estimations (timestamp, lat, lon, nb_neighbors)
@@ -354,23 +421,11 @@ async def receive_esp32_test(payload: EspBatchPayload):
                     estimated_pos['lon'], 
                     len(payload.networks)
                 ))
-            print(f"💾 Position sauvegardée en DB: {estimated_pos}")
+            print(f"Position sauvegardée dans la DB: {estimated_pos}")
         except Exception as e:
-            print(f"⚠️ Erreur sauvegarde historique: {e}")
+            print(f"Erreur de sauvegarde dans l'historique des positions : {e}")
     
     return {"status": "OK", "position": estimated_pos}
-
-@app.get("/map_test")
-async def read_map_test():
-    file_path = os.path.join(os.path.dirname(__file__), "map_test.html")
-    if os.path.exists(file_path):
-        return FileResponse(file_path)
-    return {"error": "Créez le fichier map_test.html d'abord !"}, 404
-
-@app.get("/api/last_position")
-async def get_last_position():
-    # Retourne toujours la dernière position connue en RAM
-    return last_estimated_position if last_estimated_position else {}
 
 @app.get("/")
 async def read_index():
@@ -379,15 +434,11 @@ async def read_index():
         return FileResponse(file_path)
     return {"message": "Serveur Tracking Fusion Actif"}
 
-@app.post("/post_podo")
-async def receive_podo(payload: PodoMeter):
-    print(f"Steps : {payload}")
-
 # ===========================================
 # Start up
 # ===========================================
 
 if __name__ == "__main__":
     db_conn = init_db()
-    print("🚀 Serveur FastAPI démarré sur http://localhost:5000")
+    print("Serveur FastAPI démarré sur http://localhost:5000")
     uvicorn.run(app, host="0.0.0.0", port=5000)

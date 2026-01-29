@@ -45,15 +45,15 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
     <script>
-        // 1. Initialisation de la carte
-        // On centre par défaut sur Paris (sera mis à jour dès la 1ère réception)
+        // Initialisation de la carte
+        // (centré par défaut sur Paris)
         const map = L.map('map').setView([48.8566, 2.3522], 18);
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; OpenStreetMap contributors'
         }).addTo(map);
 
-        // Création du marqueur (un cercle bleu pour différencier)
+        // marqueur : cercle bleu pour différencier
         let userMarker = L.circleMarker([0, 0], {
             radius: 10,
             fillColor: "#3388ff",
@@ -65,7 +65,7 @@
 
         let firstFix = false;
 
-        // 2. Fonction pour récupérer la position
+        // Fonction : récupération de la position
         async function fetchPosition() {
             try {
                 const response = await fetch('/api/last_position');
@@ -101,7 +101,7 @@
             }
         }
 
-        // 3. Lancer la boucle (toutes les 1 seconde)
+        // Boucle : toute les secondes
         setInterval(fetchPosition, 1000);
         
     </script>

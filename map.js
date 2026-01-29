@@ -11,6 +11,7 @@ map = new ol.Map({
   })
 });
 
+// 1 - Transmission des coordonnées du clic au serveur pour la création de la DB 
 map.on("click", (evt) => {
   const [lon, lat] = ol.proj.toLonLat(evt.coordinate);
   console.log(lat, lon);
@@ -22,7 +23,7 @@ map.on("click", (evt) => {
   });
 });
 
-// 2. Création de la couche pour afficher vos points GPS
+// 2 - Couche pour afficher les points GPS enregistrés dans la DB
 const vectorSource = new ol.source.Vector();
 
 const vectorLayer = new ol.layer.Vector({
@@ -39,16 +40,17 @@ const vectorLayer = new ol.layer.Vector({
 // Ajouter la couche à la carte
 map.addLayer(vectorLayer);
 
-// 3. Logique du bouton "Charger les points"
+// Bouton pour charger les points sur la carte
 document.getElementById('loadPointsBtn').addEventListener('click', () => {
   console.log("Chargement des points...");
 
+  // Requête au serveur
   fetch('/points')
     .then(response => response.json())
     .then(data => {
       console.log(`Reçu ${data.length} points.`);
       
-      // Nettoyer les anciens points pour éviter les doublons
+      // Supprimer les anciens points
       vectorSource.clear();
 
       if (data.length === 0) {
@@ -56,15 +58,13 @@ document.getElementById('loadPointsBtn').addEventListener('click', () => {
         return;
       }
 
-      // Pour chaque point reçu de la BDD
+      // Pour chaque point reçu de la DB
       data.forEach(point => {
-        // Vérification de sécurité pour éviter les points vides (0,0)
-        if (point.lat && point.lon) {
-          
+
+        if (point.lat && point.lon) {  
           // Création de la géométrie OpenLayers
           const feature = new ol.Feature({
             geometry: new ol.geom.Point(ol.proj.fromLonLat([point.lon, point.lat])),
-            // On peut stocker des infos dans la feature pour les popups plus tard
             rssi: point.rssi_avg,
             timestamp: point.timestamp
           });
@@ -82,3 +82,4 @@ document.getElementById('loadPointsBtn').addEventListener('click', () => {
     })
     .catch(err => console.error("Erreur chargement points:", err));
 });
+ 
