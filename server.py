@@ -97,74 +97,105 @@ class GpsData(BaseModel):
 
 def calculate_position_knn(current_scan, k=3):
     """
-    Compare le scan actuel avec l'historique de la base de donnée et retourne la position.
+    Compare le scan actuel avec les données en utilisant la distance de Mahalanobis : sqrt( sum( (diff^2) / variance ) )
     """
-
-    # Collect knowns footprints
+    
+    # Récupérer les empreintes sauvegardées avec l'écart-type (rssi_std)
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, bssid, rssi_avg, lat, lon FROM measurements WHERE lat IS NOT 0 AND lon IS NOT 0")
+        cursor.execute("SELECT timestamp, bssid, rssi_avg, rssi_std, lat, lon FROM measurements WHERE lat IS NOT 0 AND lon IS NOT 0")
         rows = cursor.fetchall()
         conn.close()
     except Exception as e:
         print(f"Erreur lecture DB pour positionnement: {e}")
         return None
 
-    # defaultdict : crée clef selon lambda si elle n'existe pas 
+    # Reconstruire les empreintes
+    # Structure : fingerprints[timestamp] = { 'coords': (lat, lon), 'signals': {bssid: {'avg': -60, 'std': 2.5}, ...} }
     fingerprints = defaultdict(lambda: {'coords': (0, 0), 'signals': {}})
     
-    # fill dict with DB values
     for row in rows:
         ts = row['timestamp']
         fingerprints[ts]['coords'] = (row['lat'], row['lon'])
-        fingerprints[ts]['signals'][row['bssid']] = row['rssi_avg']
+        # On stocke l'objet complet avec avg et std
+        fingerprints[ts]['signals'][row['bssid']] = {
+            'avg': row['rssi_avg'],
+            'std': row['rssi_std']
+        }
 
     distances = []
+    
+    # Transformer le scan actuel en dictionnaire pour accès rapide
+    # On suppose que item.rssi contient la valeur moyennée envoyée par l'ESP32
     current_signals = {item.bssid: float(item.rssi) for item in current_scan}
     
+    # Constantes pour pénalités
+    PENALTY_RSSI = -100.0   # Valeur si signal absent
+    DEFAULT_STD = 5.0       # Écart-type par défaut si absent ou inconnu
+    MIN_STD = 0.5           # Écart-type minimum pour éviter division par zéro
+
     for ts, fp_data in fingerprints.items():
-        # Only keep signals for comparison
         stored_signals = fp_data['signals']
         
-        # Check if common BSSID (measured and DB)
+        # On ignore si aucun BSSID commun
         common_keys = set(current_signals.keys()) & set(stored_signals.keys())
         if not common_keys:
             continue
 
-        # Get all BSSID (union)
-        sum_sq_diff = 0
+        sum_weighted_diff = 0
+        
+        # On compare sur l'union des réseaux
         all_keys = set(current_signals.keys()) | set(stored_signals.keys())
         
         for bssid in all_keys:
-            # returns -100 if no value found
-            v1 = current_signals.get(bssid, -100)
-            v2 = stored_signals.get(bssid, -100)
-            sum_sq_diff += (v1 - v2) ** 2
+            # Récupération des valeurs
+            rssi_curr = current_signals.get(bssid, PENALTY_RSSI)
             
-        euclidean_dist = math.sqrt(sum_sq_diff)
+            if bssid in stored_signals:
+                rssi_stored = stored_signals[bssid]['avg']
+                sigma = stored_signals[bssid]['std']
+            else:
+                rssi_stored = PENALTY_RSSI
+                sigma = DEFAULT_STD 
+
+            # Si le std est 0 (cas rare) ou très faible, on force un minimum
+            if sigma < MIN_STD: 
+                sigma = MIN_STD
+                
+            # Calcul de la distance de Mahalanobis (au carré) pour ce point
+            diff = rssi_curr - rssi_stored
+            variance = sigma ** 2
+            
+            term = (diff ** 2) / variance
+            sum_weighted_diff += term
+            
+        # Distance finale (racine carrée de la somme)
+        mahalanobis_dist = math.sqrt(sum_weighted_diff)
         
         distances.append({
-            'dist': euclidean_dist,
+            'dist': mahalanobis_dist,
             'lat': fp_data['coords'][0],
             'lon': fp_data['coords'][1]
         })
 
-    # Keep shortest distances
+    # Trier par distance
     distances.sort(key=lambda x: x['dist'])
-    nearest_neighbors = distances[:k]
     
+    # Sélectionner les k voisins
+    nearest_neighbors = distances[:k]
     if not nearest_neighbors:
         return None
 
-    # Avg lat and long
+    # Barycentre
     avg_lat = sum(n['lat'] for n in nearest_neighbors) / len(nearest_neighbors)
     avg_lon = sum(n['lon'] for n in nearest_neighbors) / len(nearest_neighbors)
     
-    print(f"Position estimée (WiFi) basée sur {len(nearest_neighbors)} voisins: {avg_lat}, {avg_lon}")
+    print(f"Position estimée (Mahalanobis) basée sur {len(nearest_neighbors)} voisins: {avg_lat:.5f}, {avg_lon:.5f}")
     
     return {'lat': avg_lat, 'lon': avg_lon}
+
 
 def lerp(start, end, alpha):
     """
