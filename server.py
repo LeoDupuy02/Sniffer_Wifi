@@ -452,6 +452,7 @@ async def receive_esp32_test(payload: EspBatchPayload):
                     estimated_pos['lon'], 
                     len(payload.networks)
                 ))
+            conn.commit()
             print(f"Position sauvegardée dans la DB: {estimated_pos}")
         except Exception as e:
             print(f"Erreur de sauvegarde dans l'historique des positions : {e}")
